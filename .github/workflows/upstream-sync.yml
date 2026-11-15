@@ -1,0 +1,99 @@
+# Fork-only workflow (reezemohtar/t3code). Not part of upstream.
+# Daily: fast-forward `main` from pingdotgg/t3code, keep upstream's own
+# workflows switched off in this fork (they need Blacksmith runners and
+# upstream secrets), and open or refresh one PR upstream main -> reeze/main.
+# Uses only the default GITHUB_TOKEN. Never merges.
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "17 21 * * *" # 05:17 WITA daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'reezemohtar/t3code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      UPSTREAM: pingdotgg/t3code
+      BASE: reeze/main
+    steps:
+      - name: Switch off upstream workflows in this fork
+        run: |
+          gh api "repos/$REPO/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.path != ".github/workflows/upstream-sync.yml" and .state == "active") | "\(.id) \(.path)"' |
+          while read -r id path; do
+            echo "disable $path"
+            gh api -X PUT "repos/$REPO/actions/workflows/$id/disable" || echo "::warning::could not disable $path"
+          done
+
+      - name: Fast-forward main from upstream
+        id: ff
+        continue-on-error: true
+        run: |
+          gh api -X POST "repos/$REPO/merge-upstream" -f branch=main
+          echo "### main fast-forwarded from $UPSTREAM" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Note when main could not be fast-forwarded
+        if: steps.ff.outcome != 'success'
+        run: |
+          {
+            echo "### main NOT fast-forwarded"
+            echo "Likely cause: upstream changed .github/workflows and GITHUB_TOKEN has no workflows scope."
+            echo "Fix by hand: gh repo sync $REPO -b main (signed in as the repo owner)."
+            echo "The PR below still tracks $UPSTREAM:main directly, so sync is not blocked."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or refresh the upstream PR
+        id: pr
+        run: |
+          head="pingdotgg:main"
+          num=$(gh pr list -R "$REPO" --base "$BASE" --state open --label upstream-sync --json number --jq '.[0].number // empty')
+          ahead=$(gh api "repos/$REPO/compare/$BASE...pingdotgg:t3code:main" --jq '.ahead_by')
+          echo "upstream commits not in $BASE: $ahead" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ahead" = "0" ]; then
+            echo "Nothing to bring in." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -z "$num" ]; then
+            num=$(gh api -X POST "repos/$REPO/pulls" \
+              -f base="$BASE" -f head="$head" -f head_repo="$UPSTREAM" \
+              -f title="Bring in upstream changes (pingdotgg/t3code main)" \
+              -f body="$(printf 'Automated by .github/workflows/upstream-sync.yml.\n\nMerge with **Create a merge commit** (never squash or rebase), so later syncs stay small.\n\nIf labelled \`conflict\`: resolve on a branch \`reeze/sync-<date>\` (merge pingdotgg/t3code main into it, fix conflicts, run vp run check:changed), then PR that into reeze/main and close this one.\n\nThis workflow never merges.')" \
+              --jq '.number')
+            gh pr edit "$num" -R "$REPO" --add-label upstream-sync
+            echo "Opened PR #$num" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Refreshed PR #$num (head follows upstream main automatically)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "num=$num" >> "$GITHUB_OUTPUT"
+
+      - name: Label conflict state
+        if: steps.pr.outputs.num != ''
+        run: |
+          num=${{ steps.pr.outputs.num }}
+          state=""
+          for i in 1 2 3 4 5 6; do
+            state=$(gh api "repos/$REPO/pulls/$num" --jq '.mergeable // "unknown"')
+            [ "$state" != "unknown" ] && break
+            sleep 10 # GitHub computes mergeability asynchronously
+          done
+          echo "PR #$num mergeable=$state" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$state" = "false" ]; then
+            gh pr edit "$num" -R "$REPO" --add-label conflict
+          elif [ "$state" = "true" ]; then
+            gh pr edit "$num" -R "$REPO" --remove-label conflict || true
+          fi
